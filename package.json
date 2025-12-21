@@ -1,0 +1,112 @@
+{
+  "name": "titan-forge-ai",
+  "displayName": "Titan Forge AI",
+  "publisher": "titan-forge",
+  "version": "1.0.0",
+  "description": "Local Titan Forge AI chat powered by Ollama.",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "keywords": [
+    "ollama",
+    "chat",
+    "ai"
+  ],
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "titanForgeAI.readFile",
+        "title": "Titan Forge AI: Read File"
+      },
+      {
+        "command": "titanForgeAI.editFile",
+        "title": "Titan Forge AI: Edit File"
+      },
+      {
+        "command": "titanForgeAI.saveFile",
+        "title": "Titan Forge AI: Save File"
+      }
+    ],
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "titanForgeAISidebar",
+          "title": "Titan Forge AI",
+          "icon": "media/titan-forge.svg"
+        }
+      ]
+    },
+    "views": {
+      "titanForgeAISidebar": [
+        {
+          "type": "webview",
+          "id": "titanForgeSidebar",
+          "name": "Titan Forge AI",
+          "icon": "media/titan-forge.svg",
+          "retainContextWhenHidden": true
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "titanForgeAI.readFile",
+          "when": "view == titanForgeSidebar",
+          "group": "navigation@1"
+        },
+        {
+          "command": "titanForgeAI.editFile",
+          "when": "view == titanForgeSidebar",
+          "group": "navigation@2"
+        },
+        {
+          "command": "titanForgeAI.saveFile",
+          "when": "view == titanForgeSidebar",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Titan Forge AI",
+      "properties": {
+        "titanForgeAI.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL for the local Ollama service.",
+          "scope": "window"
+        },
+        "titanForgeAI.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Model identifier to use when requesting completions from Ollama.",
+          "scope": "window"
+        },
+        "titanForgeAI.requestTimeout": {
+          "type": "integer",
+          "default": 60000,
+          "description": "Timeout in milliseconds for Ollama requests (minimum 10000).",
+          "minimum": 10000,
+          "scope": "window"
+        }
+      }
+    }
+  },
+  "categories": [
+    "Other"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^25.0.1",
+    "@types/vscode": "1.84.0",
+    "typescript": "^5.9.3",
+    "vscode": "^1.1.34"
+  }
+}
