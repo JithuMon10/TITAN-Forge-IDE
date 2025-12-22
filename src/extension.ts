@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { SidebarViewProvider } from './sidebarViewProvider';
 import { ChatProvider } from './chatProvider';
 import { OllamaClient } from './ollamaClient';
+import { VsCodeOllamaConfigurationProvider, VsCodeOutput } from './vscodeAdapters';
 
 let chatProvider: ChatProvider | undefined;
 let processHooksRegistered = false;
@@ -21,7 +22,10 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel.appendLine('No workspace folder detected at activation.');
   }
 
-  const ollamaClient = new OllamaClient(outputChannel);
+  const ollamaClient = new OllamaClient(
+    new VsCodeOutput(outputChannel),
+    new VsCodeOllamaConfigurationProvider()
+  );
   chatProvider = new ChatProvider(context, ollamaClient, outputChannel, version);
   const sidebarProvider = new SidebarViewProvider(context.extensionUri, chatProvider, version);
 

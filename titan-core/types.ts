@@ -32,3 +32,9 @@ export type BuildContextOutput = {
   files: ContextFile[];
   truncated: boolean;
 };
+
+// titan-core/types.ts
+
+export type ReasoningResult = {
+  answer: string;
+};
