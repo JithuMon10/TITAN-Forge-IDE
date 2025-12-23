@@ -1,41 +1,54 @@
-// titan-core/reader.ts
+import { promises as fs, Stats } from 'fs';
+import * as path from 'path';
+import { DocumentReadResult, DocumentType } from './types';
+import { readTextDocument } from './readers/textReader';
+import { readPdfDocument } from './readers/pdfReader';
+import { readDocxDocument } from './readers/docxReader';
 
-import * as fs from "fs";
-import * as path from "path";
-import { FileContent } from "./types";
+const TEXT_EXTENSION_MAP = new Map<string, DocumentType>([
+  ['.ts', 'code'],
+  ['.js', 'code'],
+  ['.json', 'json'],
+  ['.md', 'text'],
+  ['.txt', 'text']
+]);
 
-const MAX_FILE_SIZE = 50 * 1024; // 50 KB
+export async function readDocument(rootDir: string, relativePath: string): Promise<DocumentReadResult | null> {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized) {
+    return null;
+  }
 
-export function readFileSafe(
-  rootDir: string,
-  relativePath: string
-): FileContent | null {
-  const fullPath = path.join(rootDir, relativePath);
+  const fullPath = path.join(rootDir, normalized);
 
-  let stat: fs.Stats;
+  let stat: Stats;
   try {
-    stat = fs.statSync(fullPath);
+    stat = await fs.stat(fullPath);
   } catch {
     return null;
   }
 
-  if (!stat.isFile()) return null;
-
-  let buffer: Buffer;
-  try {
-    buffer = fs.readFileSync(fullPath);
-  } catch {
+  if (!stat.isFile()) {
     return null;
   }
 
-  const truncated = buffer.length > MAX_FILE_SIZE;
-  const content = truncated
-    ? buffer.slice(0, MAX_FILE_SIZE).toString("utf-8")
-    : buffer.toString("utf-8");
+  const ext = path.extname(fullPath).toLowerCase();
+  const textType = TEXT_EXTENSION_MAP.get(ext);
+  if (textType) {
+    return await readTextDocument(fullPath, normalized, textType);
+  }
 
-  return {
-    path: relativePath,
-    content,
-    truncated,
-  };
+  if (ext === '.pdf') {
+    return await readPdfDocument(fullPath, normalized);
+  }
+
+  if (ext === '.docx') {
+    return await readDocxDocument(fullPath, normalized);
+  }
+
+  return null;
+}
+
+function normalizeRelativePath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.?\//, '').trim();
 }

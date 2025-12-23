@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { buildContext } from '../titan-core/contextBuilder';
+import { DocumentOverride } from '../titan-core/types';
 import { OllamaClient } from './ollamaClient';
 import {
-  getActiveFileContext,
-  listWorkspaceFiles
-} from './titan/workspaceReader';
+  LiveWorkspaceState,
+  DiagnosticEntry as LiveDiagnosticEntry,
+  WorkspaceChangeEvent
+} from './state/liveWorkspace';
 
 type LogLevel = 'info' | 'warn' | 'error';
 
@@ -12,6 +15,21 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: number;
+}
+
+function mapDiagnosticEntry(entry: LiveDiagnosticEntry): DiagnosticEntry {
+  return {
+    path: entry.path,
+    message: entry.message,
+    severity: entry.severity,
+    code: entry.code,
+    range: {
+      startLine: entry.range.startLine,
+      startCharacter: entry.range.startCharacter,
+      endLine: entry.range.endLine,
+      endCharacter: entry.range.endCharacter
+    }
+  };
 }
 
 interface ChatSession {
@@ -26,18 +44,64 @@ interface ActiveEditorContext {
   languageId: string;
   content: string;
   truncated: boolean;
+  version: number;
+  capturedAt: number;
+  source: 'editor';
 }
 
 interface RequestedFileContext {
   path: string;
   content: string;
+  source: 'editor' | 'disk';
+  version?: number;
+  capturedAt?: number;
+}
+
+interface DiagnosticEntry {
+  path: string;
+  message: string;
+  severity: 'error' | 'warning' | 'information' | 'hint';
+  code?: string | number;
+  range: {
+    startLine: number;
+    startCharacter: number;
+    endLine: number;
+    endCharacter: number;
+  };
 }
 
 interface ConversationContext {
   editor?: ActiveEditorContext;
   workspaceFiles: string[];
   requestedFiles: RequestedFileContext[];
+  diagnostics: DiagnosticEntry[];
+  revision: number;
+  editorOverrides: number;
+  diskFiles: number;
 }
+
+interface ConversationBuildResult {
+  context: ConversationContext;
+  requestedPaths: string[];
+  missingPaths: string[];
+}
+
+interface ConversationSnapshot {
+  revision: number;
+  context: ConversationContext;
+  requestedPaths: string[];
+  capturedAt: number;
+}
+
+type LastContextInputs = {
+  sessionId: string;
+  userMessage: string;
+  mentionedFiles: string[];
+  docMentions: string[];
+  historyForPrompt: ChatMessage[];
+  requestedPaths: string[];
+  revision: number;
+};
 
 type IncomingMessage =
   | { type: 'ready' }
@@ -55,11 +119,59 @@ interface StatusMessage {
 
 const DEFAULT_SESSION_TITLE = 'Chat';
 const DEFAULT_SESSION_ID = 'session-0';
-const MAX_EDITOR_CONTENT = 8000;
+const MAX_EDITOR_CONTENT = 200000;
 const MAX_PROMPT_PREVIEW = 2000;
 const MAX_WORKSPACE_FILES = 200;
 const MAX_HISTORY = 10;
 const MAX_PERSISTED_WORKSPACE_CONTEXT = 5;
+const MAX_CONTEXT_PREP_ATTEMPTS = 3;
+const FILE_INTENT_KEYWORDS = [
+  'read',
+  'open',
+  'summarize',
+  'summarise',
+  'explain',
+  'describe',
+  'what is in',
+  'what\'s in',
+  'what is inside',
+  'analyze',
+  'analyse',
+  'answer questions from'
+];
+const DOC_LIKE_EXTENSIONS = ['.pdf', '.docx'];
+const ACTIVE_EDITOR_ALIASES = [
+  'current file',
+  'this file',
+  'active file',
+  'open file',
+  'open buffer',
+  'current buffer',
+  'the file above',
+  'the code above',
+  'the code here',
+  'the code in editor',
+  'here in the editor',
+  'my editor',
+  'what i am editing'
+];
+const IMPLICIT_CODE_INTENT = [
+  'fix',
+  'change',
+  'update',
+  'refactor',
+  'bug',
+  'error',
+  'warn',
+  'issue',
+  'why does this',
+  'what does this',
+  'how does this',
+  'can you explain this',
+  'implement',
+  'optimize',
+  'improve'
+];
 
 export class ChatProvider {
   private readonly context?: vscode.ExtensionContext;
@@ -71,6 +183,18 @@ export class ChatProvider {
   private activeSessionId: string = DEFAULT_SESSION_ID;
   private cancellationTokenSource: vscode.CancellationTokenSource | undefined;
   private readonly textDecoder = new TextDecoder();
+  private readonly workspaceState: LiveWorkspaceState;
+  private workspaceChangeRevision = 0;
+  private workspaceDebounceTimer: NodeJS.Timeout | undefined;
+  private contextPreviewTask: Promise<void> | null = null;
+  private contextPreviewPending = false;
+  private lastPreviewRevision = -1;
+  private pendingPreviewRevision: number | null = null;
+  private lastConversationSnapshot: ConversationSnapshot | null = null;
+  private readonly workspaceChangeHandlers: (() => void)[] = [];
+  private lastContextInputs: LastContextInputs | null = null;
+  private contextRefreshPromise: Promise<void> | null = null;
+  private pendingContextRefresh = false;
 
   constructor(
     _context?: vscode.ExtensionContext,
@@ -86,6 +210,26 @@ export class ChatProvider {
     const session = this.createSession(DEFAULT_SESSION_ID, DEFAULT_SESSION_TITLE);
     this.sessions.set(session.id, session);
     this.activeSessionId = session.id;
+    this.workspaceState = new LiveWorkspaceState(MAX_EDITOR_CONTENT);
+    this.workspaceState.onDidChange((event) => this.handleWorkspaceChange(event));
+    this.registerWorkspaceChangeHandler(() => this.triggerIncrementalContextRefresh());
+  }
+
+  private isDocLikePath(value: string): boolean {
+    const lower = value.toLowerCase();
+    return DOC_LIKE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+  }
+
+  private normalizeDocName(value: string): string {
+    return value.replace(/\\/g, '/').replace(/\s+/g, '').toLowerCase();
+  }
+
+  private getWorkspaceRoot(): string | null {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length === 0) {
+      return null;
+    }
+    return folders[0].uri.fsPath;
   }
 
   // -----------------------------
@@ -97,8 +241,14 @@ export class ChatProvider {
         return await this.buildWorkspaceFileListMessage();
       }
 
-      const mentionedFiles = this.findMentionedFiles(input);
-      const context = await this.collectConversationContext(input, mentionedFiles);
+      const stable = await this.collectStableConversationContext(input, [], [], {
+        recomputeMentions: true
+      });
+      const { context } = stable.buildResult;
+      if (!this.diagnosticsAllowResponse(context)) {
+        return this.formatDiagnosticsRefusal(context);
+      }
+
       // In handleMessage we don't have a session yet, so we'll just pass a dummy array or modify handleMessage to take a session
       // But handleMessage is the entry point from sidebar presumably?
       // Actually handleMessage is called by tests or external callers.
@@ -122,6 +272,22 @@ export class ChatProvider {
     this.cancellationTokenSource?.dispose();
     this.cancellationTokenSource = undefined;
     this.webviewView = undefined;
+    if (this.workspaceDebounceTimer) {
+      clearTimeout(this.workspaceDebounceTimer);
+      this.workspaceDebounceTimer = undefined;
+    }
+    this.lastContextInputs = null;
+    this.workspaceState.dispose();
+  }
+
+  registerWorkspaceChangeHandler(handler: () => void): vscode.Disposable {
+    this.workspaceChangeHandlers.push(handler);
+    return new vscode.Disposable(() => {
+      const index = this.workspaceChangeHandlers.indexOf(handler);
+      if (index >= 0) {
+        this.workspaceChangeHandlers.splice(index, 1);
+      }
+    });
   }
 
   attachWebview(webviewView: vscode.WebviewView): void {
@@ -220,6 +386,7 @@ export class ChatProvider {
     this.sessions.set(session.id, session);
     this.activeSessionId = session.id;
     this.postSessions('sessions');
+    this.lastContextInputs = null;
   }
 
   private handleSwitchSession(sessionId: string): void {
@@ -229,6 +396,10 @@ export class ChatProvider {
     }
     this.activeSessionId = sessionId;
     this.postSessions('sessions');
+    const snapshot = this.lastContextInputs;
+    if (!snapshot || snapshot.sessionId !== sessionId) {
+      this.lastContextInputs = null;
+    }
   }
 
   private handleClearSession(): void {
@@ -238,6 +409,9 @@ export class ChatProvider {
     }
     session.messages = [];
     this.postSessions('sessions');
+    if (this.lastContextInputs?.sessionId === session.id) {
+      this.lastContextInputs = null;
+    }
   }
 
   private async handleSendMessage(sessionId: string, content: string): Promise<void> {
@@ -316,20 +490,67 @@ export class ChatProvider {
       return;
     }
 
-    let context: ConversationContext;
-    let prompt: string;
+    let buildResult: ConversationBuildResult | null = null;
+    let context: ConversationContext | null = null;
+    let prompt: string | null = null;
+    let mentionedFiles: string[] = [];
+    let docMentions: string[] = [];
+    let historyForPrompt: ChatMessage[] = [];
+
     try {
-      const mentionedFiles = this.findMentionedFiles(content);
-      context = await this.collectConversationContext(content, mentionedFiles);
-      
-      // Use promptContent for the last message in the prompt
-      const historyForPrompt = [...session.messages];
-      if (isOutputRequest && historyForPrompt.length > 0) {
-        const lastMsg = historyForPrompt[historyForPrompt.length - 1];
-        historyForPrompt[historyForPrompt.length - 1] = { ...lastMsg, content: promptContent };
+      let prepared = false;
+
+      for (let attempt = 0; attempt < MAX_CONTEXT_PREP_ATTEMPTS && !prepared; attempt += 1) {
+        const stable = await this.collectStableConversationContext(content, mentionedFiles, docMentions, {
+          recomputeMentions: true
+        });
+
+        buildResult = stable.buildResult;
+        context = buildResult.context;
+        mentionedFiles = stable.mentionedFiles;
+        docMentions = stable.docMentions;
+
+        historyForPrompt = this.cloneMessagesForPrompt(
+          session.messages,
+          isOutputRequest ? promptContent : undefined
+        );
+
+        const candidatePrompt = this.composePrompt(historyForPrompt, context);
+        const postComposeRevision = this.workspaceState.getRevision();
+
+        if (postComposeRevision !== context.revision) {
+          this.log(
+            `Workspace changed during prompt composition (rev ${postComposeRevision} != ${context.revision}); retrying context capture...`,
+            'info'
+          );
+          continue;
+        }
+
+        prompt = candidatePrompt;
+        prepared = true;
       }
 
-      prompt = this.composePrompt(historyForPrompt, context);
+      if (!prepared || !buildResult || !context || !prompt) {
+        throw new Error(
+          'Workspace changed while preparing context. Please pause edits momentarily and resend your request.'
+        );
+      }
+
+      this.setLastContextInputs({
+        sessionId: session.id,
+        userMessage: content,
+        mentionedFiles,
+        docMentions,
+        historyForPrompt,
+        requestedPaths: buildResult.requestedPaths,
+        revision: context.revision
+      });
+      this.lastConversationSnapshot = {
+        revision: context.revision,
+        context,
+        requestedPaths: [...buildResult.requestedPaths],
+        capturedAt: Date.now()
+      };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       const message = err.message || 'Failed to prepare context.';
@@ -339,8 +560,23 @@ export class ChatProvider {
       return;
     }
 
+    if (!context || !buildResult || !prompt) {
+      const message = 'Failed to stabilise the workspace context. Please try again.';
+      this.log(message, 'error');
+      this.postChatError(message);
+      this.postStatus('idle');
+      return;
+    }
+
     this.postContextPreview(context, prompt);
     this.postContextBadges(context);
+
+    if (!this.diagnosticsAllowResponse(context)) {
+      const refusal = this.formatDiagnosticsRefusal(context);
+      commitAssistantMessage(refusal);
+      this.postStatus('idle');
+      return;
+    }
 
     this.postStatus('processing');
 
@@ -391,6 +627,20 @@ Example format:
       this.cancellationTokenSource?.dispose();
       this.cancellationTokenSource = undefined;
       this.postStatus('idle');
+    }
+
+    const safeContext = context;
+    if (!safeContext || !prompt) {
+      this.postChatError('Failed to prepare response context. Please try again.');
+      return;
+    }
+
+    const revisionBeforeCommit = this.workspaceState.getRevision();
+    if (revisionBeforeCommit !== safeContext.revision) {
+      const message = 'Workspace changed while generating the response. Please resend your request to use the latest code.';
+      this.log(message, 'warn');
+      this.postChatError(message);
+      return;
     }
 
     if (!assistantReply) {
@@ -481,7 +731,11 @@ Example format:
       editorLines: context.editor ? this.truncateForPreview(context.editor.content, 400) : '',
       hasWorkspace: context.workspaceFiles.length > 0 || context.requestedFiles.length > 0,
       workspaceFiles: [...context.workspaceFiles, ...context.requestedFiles.map((file) => file.path)],
-      finalPrompt: this.truncateForPreview(prompt, MAX_PROMPT_PREVIEW)
+      finalPrompt: this.truncateForPreview(prompt, MAX_PROMPT_PREVIEW),
+      revision: context.revision,
+      editorOverrides: context.editorOverrides,
+      diskFiles: context.diskFiles,
+      diagnostics: context.diagnostics.length
     };
 
     this.postToWebview('contextPreview', { preview });
@@ -490,9 +744,19 @@ Example format:
   private postContextBadges(context: ConversationContext): void {
     const sources = {
       hasEditor: Boolean(context.editor),
-      hasWorkspace: context.workspaceFiles.length > 0 || context.requestedFiles.length > 0
+      hasWorkspace: context.workspaceFiles.length > 0 || context.requestedFiles.length > 0,
+      revision: context.revision,
+      diagnostics: context.diagnostics.length
     };
     this.postToWebview('contextBadges', { sources });
+  }
+
+  private ensureContextCompleteness(result: ConversationBuildResult): void {
+    if (result.missingPaths.length > 0) {
+      throw new Error(
+        `Live buffers missing for: ${result.missingPaths.join(', ')}. Unable to prepare complete context.`
+      );
+    }
   }
 
   private postToWebview(type: string, payload: unknown): void {
@@ -508,67 +772,508 @@ Example format:
     }
   }
 
-  private async collectConversationContext(userMessage: string, mentionedFiles: string[]): Promise<ConversationContext> {
-    const [editor, workspaceFilesRaw] = await Promise.all([
-      getActiveFileContext(),
-      listWorkspaceFiles()
+  private async collectConversationContext(
+    userMessage: string,
+    mentionedFiles: string[],
+    docMentions: string[]
+  ): Promise<ConversationBuildResult> {
+    const revision = this.workspaceState.getRevision();
+    const [editorSnapshot, workspaceFilesRaw, diagnosticsRaw] = await Promise.all([
+      this.workspaceState.getActiveEditorContext(),
+      this.workspaceState.getWorkspaceFiles(),
+      Promise.resolve(this.workspaceState.getDiagnostics())
     ]);
 
-    const requestedFiles = await this.getRequestedFiles(mentionedFiles, workspaceFilesRaw);
+    const workspaceFiles = this.limitWorkspaceFiles(workspaceFilesRaw);
+    const diagnostics = diagnosticsRaw.map(mapDiagnosticEntry);
+
+    const docRequestedPaths = this.resolveDocFileMatches(userMessage, docMentions, workspaceFilesRaw);
+    const nonDocMentions = mentionedFiles.filter((entry) => !this.isDocLikePath(entry));
+    const resolvedNonDocPaths = this.resolveWorkspacePaths(nonDocMentions, workspaceFilesRaw);
+    let combinedPaths = this.mergeRequestedPaths(resolvedNonDocPaths, docRequestedPaths);
+
+    const targetsActiveEditor = this.targetsActiveEditor(userMessage, mentionedFiles, docMentions);
+    if (targetsActiveEditor && editorSnapshot?.path) {
+      combinedPaths = this.mergeRequestedPaths(combinedPaths, [editorSnapshot.path]);
+    }
+
+    const overrides = this.workspaceState.getOverridesForPaths(combinedPaths, editorSnapshot?.path);
+
+    const editor: ActiveEditorContext | undefined = editorSnapshot
+      ? {
+          path: editorSnapshot.path,
+          languageId: editorSnapshot.languageId,
+          content: editorSnapshot.content,
+          truncated: editorSnapshot.truncated,
+          version: editorSnapshot.version,
+          capturedAt: editorSnapshot.capturedAt,
+          source: editorSnapshot.source
+        }
+      : undefined;
+
+    const contextFiles = await this.buildContextFiles(editor ?? null, combinedPaths, overrides);
+
+    const normalizedToOriginal = new Map<string, string>();
+    combinedPaths.forEach((entry) => {
+      const normalized = this.normalizePath(entry) ?? entry;
+      if (!normalizedToOriginal.has(normalized)) {
+        normalizedToOriginal.set(normalized, entry);
+      }
+    });
+    if (editor?.path) {
+      const normalizedEditor = this.normalizePath(editor.path) ?? editor.path;
+      if (!normalizedToOriginal.has(normalizedEditor)) {
+        normalizedToOriginal.set(normalizedEditor, editor.path);
+      }
+    }
+
+    const seen = new Set<string>();
+    contextFiles.forEach((file) => {
+      const normalized = this.normalizePath(file.path) ?? file.path;
+      seen.add(normalized);
+    });
+    const missingPaths: string[] = [];
+    normalizedToOriginal.forEach((original, normalized) => {
+      if (!seen.has(normalized)) {
+        missingPaths.push(original);
+      }
+    });
+
+    const editorOverrides = contextFiles.filter((file) => file.source === 'editor').length;
+    const diskFiles = contextFiles.filter((file) => file.source === 'disk').length;
+
+    const context: ConversationContext = {
+      editor,
+      workspaceFiles,
+      requestedFiles: contextFiles,
+      diagnostics,
+      revision,
+      editorOverrides,
+      diskFiles
+    };
 
     return {
-      editor: editor ?? undefined,
-      workspaceFiles: this.limitWorkspaceFiles(workspaceFilesRaw),
-      requestedFiles
+      context,
+      requestedPaths: combinedPaths,
+      missingPaths
     };
   }
 
-  private async getRequestedFiles(requestedNames: string[], workspaceFiles: string[]): Promise<RequestedFileContext[]> {
+  private findDocLikeMentions(message: string): string[] {
+    const matches = new Set<string>();
+
+    const loosePattern = /([A-Za-z0-9 _()[\]-]+?\.(?:pdf|docx))/gi;
+    let result: RegExpExecArray | null;
+    while ((result = loosePattern.exec(message)) !== null) {
+      const candidate = result[1]?.trim();
+      if (candidate) {
+        matches.add(candidate);
+      }
+    }
+
+    this.findMentionedFiles(message)
+      .filter((entry) => this.isDocLikePath(entry))
+      .forEach((entry) => matches.add(entry));
+
+    return Array.from(matches.values());
+  }
+
+  private resolveDocFileMatches(
+    userMessage: string,
+    docMentions: string[],
+    workspaceFiles: string[]
+  ): string[] {
+    const hasIntent = this.hasDocumentIntent(userMessage);
+    if (!hasIntent && docMentions.length === 0) {
+      return [];
+    }
+
+    const normalizedMentions = new Set<string>(
+      docMentions.map((entry) => this.normalizeDocName(entry))
+    );
+
+    const matches: string[] = [];
+    for (const file of workspaceFiles) {
+      if (!this.isDocLikePath(file)) {
+        continue;
+      }
+      const normalizedPath = this.normalizePath(file);
+      if (!normalizedPath) {
+        continue;
+      }
+      const normalizedName = this.normalizeDocName(path.basename(file));
+
+      if (normalizedMentions.size === 0) {
+        if (hasIntent) {
+          matches.push(file);
+        }
+        continue;
+      }
+
+      if (
+        normalizedMentions.has(normalizedName) ||
+        normalizedMentions.has(this.normalizeDocName(normalizedPath))
+      ) {
+        matches.push(file);
+      }
+    }
+    return matches;
+  }
+
+  private hasDocumentIntent(message: string): boolean {
+    const normalized = message.toLowerCase();
+    return FILE_INTENT_KEYWORDS.some((keyword) => normalized.includes(keyword));
+  }
+
+  private mergeRequestedPaths(primary: string[], secondary: string[]): string[] {
+    const normalized = new Set<string>();
+    const merged: string[] = [];
+
+    const addPath = (entry: string): void => {
+      const normalizedPath = this.normalizePath(entry);
+      if (!normalizedPath || normalized.has(normalizedPath)) {
+        return;
+      }
+      normalized.add(normalizedPath);
+      merged.push(entry);
+    };
+
+    primary.forEach(addPath);
+    secondary.forEach(addPath);
+
+    return merged;
+  }
+
+  private resolveWorkspacePaths(requestedNames: string[], workspaceFiles: string[]): string[] {
     if (requestedNames.length === 0) {
       return [];
     }
 
-    const results: RequestedFileContext[] = [];
+    const resolved: string[] = [];
     const seen = new Set<string>();
-    const attemptedPaths = new Set<string>(); // Prevent retry loops for same path
 
     for (const request of requestedNames) {
       const key = request.trim();
-      if (!key || seen.has(key)) {
+      if (!key) {
         continue;
       }
-      
-      if (attemptedPaths.has(key)) {
-        this.log(`Skipping duplicate read attempt for: ${key}`, 'warn');
-        continue;
-      }
-      
-      seen.add(key);
-      attemptedPaths.add(key);
 
       try {
         const uri = this.resolveRequestedFileUri(key, workspaceFiles);
-        // Additional check for resolved path to ensure uniqueness
-        const fsPath = uri.fsPath;
-        if (attemptedPaths.has(fsPath)) {
-             this.log(`Skipping duplicate read attempt for resolved path: ${fsPath}`, 'warn');
-             continue;
+        const displayPath = this.getDisplayPath(uri);
+        const normalized = this.normalizePath(displayPath);
+        if (normalized && seen.has(normalized)) {
+          continue;
         }
-        attemptedPaths.add(fsPath);
-
-        const rawContent = await vscode.workspace.fs.readFile(uri);
-        results.push({
-          path: this.getDisplayPath(uri),
-          content: this.textDecoder.decode(rawContent)
-        });
+        if (normalized) {
+          seen.add(normalized);
+        }
+        resolved.push(displayPath);
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
-        // We log the error but do NOT throw, allowing the "Reasoning Fallback" to kick in
-        this.log(`Failed to read file ${key}: ${err.message}`, 'warn');
-        // We do NOT add a partial result, effectively simulating "tool failed" so the LLM must rely on reasoning
+        this.log(`Failed to resolve file ${key}: ${err.message}`, 'warn');
       }
     }
-    return results;
+
+    return resolved;
+  }
+
+  private async buildContextFiles(
+    activeEditor: ActiveEditorContext | null,
+    requestedPaths: string[],
+    overrides: DocumentOverride[]
+  ): Promise<RequestedFileContext[]> {
+    const rootDir = this.getWorkspaceRoot();
+    if (!rootDir) {
+      this.log('Cannot build document context: workspace root not found.', 'warn');
+      return [];
+    }
+
+    const context = await buildContext({
+      rootDir,
+      activeFile: activeEditor?.path,
+      requestedFiles: requestedPaths,
+      maxChars: MAX_EDITOR_CONTENT,
+      overrides,
+      protectedPaths: this.workspaceState.getOpenDocumentPaths()
+    });
+    return context.files.map((file) => ({
+      path: file.path,
+      content: file.content,
+      source: file.source,
+      version: file.version,
+      capturedAt: file.capturedAt
+    }));
+  }
+
+  private handleWorkspaceChange(event: WorkspaceChangeEvent): void {
+    if (event.revision <= this.workspaceChangeRevision) {
+      return;
+    }
+    this.workspaceChangeRevision = event.revision;
+
+    const shouldRefresh = this.shouldTriggerContextRefresh(event);
+    if (!shouldRefresh) {
+      return;
+    }
+
+    this.scheduleWorkspaceRefreshNotification();
+  }
+
+  private shouldTriggerContextRefresh(event: WorkspaceChangeEvent): boolean {
+    switch (event.type) {
+      case 'documents':
+      case 'workspaceFiles':
+      case 'diagnostics':
+      case 'activeEditor':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private scheduleWorkspaceRefreshNotification(): void {
+    if (this.workspaceDebounceTimer) {
+      clearTimeout(this.workspaceDebounceTimer);
+    }
+
+    this.workspaceDebounceTimer = setTimeout(() => {
+      this.workspaceDebounceTimer = undefined;
+      this.workspaceChangeHandlers.forEach((fn: () => void) => {
+        try {
+          fn();
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          this.log(`Workspace change handler failed: ${err.message}`, 'warn');
+        }
+      });
+    }, 75);
+  }
+
+  private triggerIncrementalContextRefresh(): void {
+    if (!this.lastContextInputs) {
+      return;
+    }
+
+    if (this.contextRefreshPromise) {
+      this.pendingContextRefresh = true;
+      return;
+    }
+
+    this.contextRefreshPromise = this.performIncrementalContextRefresh()
+      .catch((error) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.log(`Incremental context refresh failed: ${err.message}`, 'warn');
+      })
+      .finally(() => {
+        this.contextRefreshPromise = null;
+        if (this.pendingContextRefresh) {
+          this.pendingContextRefresh = false;
+          this.triggerIncrementalContextRefresh();
+        }
+      });
+  }
+
+  private async performIncrementalContextRefresh(): Promise<void> {
+    const snapshot = this.lastContextInputs;
+    if (!snapshot) {
+      return;
+    }
+
+    const session = this.sessions.get(snapshot.sessionId);
+    if (!session) {
+      this.lastContextInputs = null;
+      return;
+    }
+
+    try {
+      const stable = await this.collectStableConversationContext(
+        snapshot.userMessage,
+        snapshot.mentionedFiles,
+        snapshot.docMentions,
+        { recomputeMentions: true }
+      );
+
+      const buildResult = stable.buildResult;
+      const context = buildResult.context;
+      const prompt = this.composePrompt(snapshot.historyForPrompt, context);
+      const postComposeRevision = this.workspaceState.getRevision();
+
+      if (postComposeRevision !== context.revision) {
+        this.log(
+          `Workspace changed during incremental refresh (rev ${postComposeRevision} != ${context.revision}); deferring update.`,
+          'info'
+        );
+        return;
+      }
+
+      this.setLastContextInputs({
+        sessionId: snapshot.sessionId,
+        userMessage: snapshot.userMessage,
+        mentionedFiles: stable.mentionedFiles,
+        docMentions: stable.docMentions,
+        historyForPrompt: snapshot.historyForPrompt,
+        requestedPaths: buildResult.requestedPaths,
+        revision: context.revision
+      });
+
+      this.postContextPreview(context, prompt);
+      this.postContextBadges(context);
+      this.lastConversationSnapshot = {
+        revision: context.revision,
+        context,
+        requestedPaths: [...buildResult.requestedPaths],
+        capturedAt: Date.now()
+      };
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.log(`Failed to refresh context after workspace change: ${err.message}`, 'warn');
+    }
+  }
+
+  private ensureContextHasFiles(context: ConversationContext): void {
+    if (!context.editor && context.requestedFiles.length === 0) {
+      throw new Error('No live workspace files captured. Open or reference the relevant file before asking.');
+    }
+  }
+
+  private diagnosticsAllowResponse(context: ConversationContext): boolean {
+    const blocking = this.getBlockingDiagnostics(context);
+    return blocking.length === 0;
+  }
+
+  private getBlockingDiagnostics(context: ConversationContext): DiagnosticEntry[] {
+    const trackedPaths = new Set<string>();
+    if (context.editor?.path) {
+      trackedPaths.add(this.normalizePath(context.editor.path) ?? context.editor.path);
+    }
+    context.requestedFiles.forEach((file) => {
+      const normalized = this.normalizePath(file.path) ?? file.path;
+      trackedPaths.add(normalized);
+    });
+
+    return context.diagnostics.filter((diag) => {
+      if (diag.severity !== 'error') {
+        return false;
+      }
+      const normalized = this.normalizePath(diag.path) ?? diag.path;
+      return trackedPaths.size === 0 || trackedPaths.has(normalized);
+    });
+  }
+
+  private formatDiagnosticsRefusal(context: ConversationContext): string {
+    const blocking = this.getBlockingDiagnostics(context);
+    if (blocking.length === 0) {
+      return 'Workspace diagnostics are clean.';
+    }
+
+    const lines: string[] = [
+      'I cannot proceed because the live workspace has blocking diagnostics:',
+      ''
+    ];
+
+    blocking.slice(0, 10).forEach((diag) => {
+      lines.push(
+        `- ${diag.path}:${diag.range.startLine + 1}:${diag.range.startCharacter + 1} — ${diag.message}`
+      );
+    });
+
+    if (blocking.length > 10) {
+      lines.push(`- …and ${blocking.length - 10} more issues.`);
+    }
+
+    lines.push('', 'Resolve these diagnostics, then resend your request.');
+    return lines.join('\n');
+  }
+
+  private async collectStableConversationContext(
+    userMessage: string,
+    mentionedFiles: string[],
+    docMentions: string[],
+    options?: { recomputeMentions?: boolean; maxAttempts?: number }
+  ): Promise<{
+    buildResult: ConversationBuildResult;
+    mentionedFiles: string[];
+    docMentions: string[];
+  }> {
+    const attempts = options?.maxAttempts ?? MAX_CONTEXT_PREP_ATTEMPTS;
+    let currentMentioned = mentionedFiles;
+    let currentDocMentions = docMentions;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (options?.recomputeMentions !== false) {
+        currentMentioned = this.findMentionedFiles(userMessage);
+        currentDocMentions = this.findDocLikeMentions(userMessage);
+      }
+
+      const buildResult = await this.collectConversationContext(
+        userMessage,
+        currentMentioned,
+        currentDocMentions
+      );
+
+      this.ensureContextCompleteness(buildResult);
+      this.ensureContextHasFiles(buildResult.context);
+
+      const revisionAfterBuild = this.workspaceState.getRevision();
+      if (revisionAfterBuild === buildResult.context.revision) {
+        return {
+          buildResult,
+          mentionedFiles: currentMentioned,
+          docMentions: currentDocMentions
+        };
+      }
+
+      this.log(
+        `Workspace changed during context capture (rev ${revisionAfterBuild} != ${buildResult.context.revision}); retrying...`,
+        'info'
+      );
+    }
+
+    throw new Error(
+      'Workspace changed repeatedly while preparing context. Wait for edits to settle and resend your request.'
+    );
+  }
+
+  private targetsActiveEditor(
+    userMessage: string,
+    mentionedFiles: string[],
+    docMentions: string[]
+  ): boolean {
+    const normalized = userMessage.toLowerCase();
+    const mentionsActiveAlias = ACTIVE_EDITOR_ALIASES.some((alias) => normalized.includes(alias));
+    if (mentionsActiveAlias) {
+      return true;
+    }
+
+    const mentionsAnyFile = mentionedFiles.length > 0 || docMentions.length > 0;
+    const hasCodeIntent = IMPLICIT_CODE_INTENT.some((token) => normalized.includes(token));
+    if (hasCodeIntent && !mentionsAnyFile) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private cloneMessagesForPrompt(messages: ChatMessage[], overrideLastContent?: string): ChatMessage[] {
+    const cloned = messages.map((message) => ({ ...message }));
+    if (overrideLastContent && cloned.length > 0) {
+      const lastIndex = cloned.length - 1;
+      cloned[lastIndex] = { ...cloned[lastIndex], content: overrideLastContent };
+    }
+    return cloned;
+  }
+
+  private setLastContextInputs(inputs: LastContextInputs): void {
+    this.lastContextInputs = {
+      sessionId: inputs.sessionId,
+      userMessage: inputs.userMessage,
+      mentionedFiles: [...inputs.mentionedFiles],
+      docMentions: [...inputs.docMentions],
+      historyForPrompt: inputs.historyForPrompt.map((message) => ({ ...message })),
+      requestedPaths: [...inputs.requestedPaths],
+      revision: inputs.revision
+    };
   }
 
   private composePrompt(history: ChatMessage[], context: ConversationContext): string {
@@ -579,6 +1284,8 @@ Example format:
     const isOutputRequest = /(example|sample|show|provide|what).*output|run.*code|execute/i.test(lastUserMessage);
 
     const lines: string[] = [
+      `Context Revision: ${context.revision} (editor overrides: ${context.editorOverrides}, disk files: ${context.diskFiles})`,
+      '' ,
       '# SYSTEM INSTRUCTIONS - READ CAREFULLY',
       'You are TITAN, a precise and deterministic coding assistant.',
       'Your responses must be based SOLELY on the files and context provided below.',
@@ -643,8 +1350,23 @@ Example format:
     if (context.requestedFiles.length > 0) {
       lines.push('## REQUESTED FILES', '');
       context.requestedFiles.forEach(file => {
-        lines.push(`### ${file.path}`, '```', file.content, '```', '');
+        const metadata: string[] = [`Source: ${file.source}`];
+        if (file.version !== undefined) {
+          metadata.push(`Version: ${file.version}`);
+        }
+        if (file.capturedAt !== undefined) {
+          metadata.push(`Captured: ${new Date(file.capturedAt).toISOString()}`);
+        }
+        lines.push(`### ${file.path}`, `<!-- ${metadata.join(' | ')} -->`, '```', file.content, '```', '');
       });
+    }
+
+    if (context.diagnostics.length > 0) {
+      lines.push('## DIAGNOSTICS (AUTHORITATIVE)', '');
+      context.diagnostics.forEach((diag) => {
+        lines.push(`- [${diag.severity.toUpperCase()}] ${diag.path}:${diag.range.startLine + 1}:${diag.range.startCharacter + 1} – ${diag.message}`);
+      });
+      lines.push('');
     }
 
     // Add workspace files list (not content)
@@ -768,6 +1490,9 @@ Example format:
     const normalizedRequest = this.normalizePath(request);
     const candidates = workspaceFiles.filter((entry) => {
       const normalizedEntry = this.normalizePath(entry);
+      if (!normalizedEntry || !normalizedRequest) {
+        return false;
+      }
       return (
         normalizedEntry === normalizedRequest ||
         normalizedEntry.endsWith(`/${normalizedRequest}`)
@@ -791,13 +1516,17 @@ Example format:
     return vscode.Uri.joinPath(workspaceFolders[0].uri, matchedEntry);
   }
 
-  private normalizePath(value: string): string {
-    return value.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
-  }
-
   private getDisplayPath(uri: vscode.Uri): string {
     const relative = vscode.workspace.asRelativePath(uri, false);
     return relative && relative !== uri.fsPath ? relative : uri.fsPath;
+  }
+
+  private normalizePath(value: string): string | null {
+    if (!value) {
+      return null;
+    }
+    const normalized = value.replace(/\\/g, '/').replace(/^\.?\//, '').trim().toLowerCase();
+    return normalized.length > 0 ? normalized : null;
   }
 
   private isListFilesRequest(message: string): boolean {
@@ -806,7 +1535,7 @@ Example format:
   }
 
   private async buildWorkspaceFileListMessage(): Promise<string> {
-    const files = await listWorkspaceFiles();
+    const files = await this.workspaceState.getWorkspaceFiles();
     if (files.length === 0) {
       return 'No files found in the current workspace.';
     }

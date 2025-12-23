@@ -26,6 +26,8 @@ const EXTENSION_LANGUAGE_MAP: Record<string, string> = {
   ".json": "json",
   ".md": "markdown",
   ".txt": "text",
+  ".pdf": "pdf",
+  ".docx": "docx",
 };
 
 export function scanWorkspace(rootDir: string): FileInfo[] {

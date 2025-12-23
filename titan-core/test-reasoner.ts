@@ -14,7 +14,7 @@ async function run(): Promise<void> {
   }
 
   const [primaryFile] = workspaceEntries;
-  const context = buildContext({
+  const context = await buildContext({
     rootDir,
     activeFile: primaryFile.path,
     maxChars: 6000
