@@ -4,13 +4,16 @@
   "publisher": "titan-forge",
   "version": "1.0.0",
   "description": "Local Titan Forge AI chat powered by Ollama.",
-  "main": "./dist/extension.js",
+  "main": "./dist/src/extension.js",
   "activationEvents": [
     "*"
   ],
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./"
+    "watch": "tsc -w -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./dist/src/test/runTest.js"
   },
   "keywords": [
     "ollama",
@@ -33,6 +36,14 @@
       {
         "command": "titanForgeAI.saveFile",
         "title": "Titan Forge AI: Save File"
+      },
+      {
+        "command": "titanForgeAI.createFile",
+        "title": "Titan Forge AI: Create New File"
+      },
+      {
+        "command": "titanForgeAI.generateScript",
+        "title": "Titan Forge AI: Generate Script"
       }
     ],
     "viewsContainers": {
@@ -85,8 +96,8 @@
         },
         "titanForgeAI.model": {
           "type": "string",
-          "default": "qwen2.5-coder:7b",
-          "description": "Model identifier to use when requesting completions from Ollama.",
+          "default": "dolphin-mistral:7b",
+          "description": "Model identifier for Ollama. Recommended: dolphin-mistral:7b (uncensored) or qwen2.5-coder:7b",
           "scope": "window"
         },
         "titanForgeAI.requestTimeout": {
@@ -104,13 +115,23 @@
   ],
   "license": "ISC",
   "devDependencies": {
+    "@bufbuild/buf": "^1.32.0",
+    "@bufbuild/protoc-gen-es": "^1.8.0",
+    "@connectrpc/protoc-gen-connect-es": "^1.4.0",
     "@types/adm-zip": "^0.5.7",
-    "@types/node": "^25.0.1",
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.20",
     "@types/vscode": "1.84.0",
+    "@vscode/test-electron": "^2.3.9",
+    "glob": "^10.3.10",
+    "mocha": "^10.2.0",
     "typescript": "^5.9.3",
     "vscode": "^1.1.34"
   },
   "dependencies": {
+    "@connectrpc/connect": "^1.4.0",
+    "@connectrpc/connect-node": "^1.4.0",
     "adm-zip": "^0.5.16",
     "pdf-parse": "^2.4.5"
   }

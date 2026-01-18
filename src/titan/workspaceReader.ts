@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 
 const MAX_EDITOR_CONTENT = 8000;
 
@@ -70,7 +71,8 @@ function resolveWorkspacePath(target: string): vscode.Uri | undefined {
   }
 
   const sanitized = target.replace(/^\.?[\\/]+/, '');
-  return vscode.Uri.joinPath(folders[0].uri, sanitized);
+  const absolute = path.join(folders[0].uri.fsPath, sanitized);
+  return vscode.Uri.file(absolute);
 }
 
 function pathIsAbsolute(value: string): boolean {

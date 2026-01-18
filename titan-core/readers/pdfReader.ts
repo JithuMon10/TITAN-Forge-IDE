@@ -7,8 +7,8 @@ type PdfParseResult = {
 
 type PdfParseFn = (data: Buffer) => Promise<PdfParseResult>;
 
-// pdf-parse ships CommonJS without types; require and cast to callable signature
-const pdfParse: PdfParseFn = require('pdf-parse');
+// Force pdf-parse to use the Node.js-specific build to avoid browser-only code.
+const pdfParse: PdfParseFn = require('pdf-parse/node');
 
 const MAX_PDF_CHARS = 50 * 1024; // 50 KB
 

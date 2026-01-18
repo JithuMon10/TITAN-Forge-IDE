@@ -13,8 +13,15 @@
     "inlineSources": true,
     "types": [
       "node",
-      "vscode"
-    ]
+      "vscode",
+      "mocha"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "src/*"
+      ]
+    }
   },
   "include": [
     "src",

@@ -2,7 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { Output } from '../titan-core/output';
 
-export const DEFAULT_MODEL = 'qwen2.5-coder:7b';
+export const DEFAULT_MODEL = 'dolphin-mistral:7b';
 export const DEFAULT_OLLAMA_URL = 'http://localhost:11434';
 export const DEFAULT_TIMEOUT_MS = 60_000;
 
@@ -64,7 +64,7 @@ export class OllamaClient {
   constructor(
     private readonly output: Output,
     private readonly configurationProvider: OllamaConfigurationProvider = DEFAULT_CONFIGURATION_PROVIDER
-  ) {}
+  ) { }
 
   async checkHealth(): Promise<boolean> {
     try {

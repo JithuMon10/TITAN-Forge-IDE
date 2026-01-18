@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { ChatProvider } from './chatProvider';
 
 export class SidebarViewProvider implements vscode.WebviewViewProvider {
@@ -11,9 +12,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
+    const mediaRoot = vscode.Uri.file(path.join(this.extensionUri.fsPath, 'media'));
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')]
+      localResourceRoots: [mediaRoot]
     };
 
     try {
@@ -133,8 +135,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
               line-height: 1.5;
               background: var(--vscode-editor-background);
               box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
-              overflow: hidden;
-              word-break: break-word;
+              overflow-wrap: break-word;
+              white-space: pre-wrap;
             }
 
             .message.user .bubble {
@@ -178,16 +180,32 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
               color: var(--vscode-textLink-foreground);
             }
 
+            @keyframes spin {
+              0% { transform: rotate(0deg); }
+              100% { transform: rotate(360deg); }
+            }
+
+            .spinner {
+              border: 2px solid var(--vscode-descriptionForeground);
+              border-top-color: transparent;
+              border-radius: 50%;
+              width: 12px;
+              height: 12px;
+              animation: spin 0.8s linear infinite;
+            }
+
             #thinking-indicator {
               display: none;
               font-size: 12px;
               color: var(--vscode-descriptionForeground);
+              padding: 8px 0;
+              justify-content: center;
+              align-items: center;
+              gap: 8px;
             }
 
             body[data-state="busy"] #thinking-indicator {
-              display: inline-flex;
-              align-items: center;
-              gap: 6px;
+              display: flex;
             }
 
             .composer {
@@ -384,7 +402,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             </div>
             <section class="chat-area" id="chat" aria-label="Chat conversation">
               <div id="chat-messages" role="log" aria-live="polite"></div>
-              <div id="thinking-indicator" aria-live="polite">Thinking…</div>
+                            <div id="thinking-indicator" aria-live="polite">
+                <div class="spinner"></div>
+                <span id="thinking-label">Thinking…</span>
+              </div>
             </section>
             <form id="chat-form" class="composer" autocomplete="off">
               <textarea id="chat-input" placeholder="Ask TITAN…" spellcheck="false"></textarea>
@@ -417,7 +438,8 @@ ${scriptContent}
   const contextPreviewContent = document.getElementById('context-preview-content');
   const chatSessionSelector = document.getElementById('chat-session-selector');
   const chatMessages = document.getElementById('chat-messages');
-  const thinkingIndicator = document.getElementById('thinking-indicator');
+    const thinkingIndicator = document.getElementById('thinking-indicator');
+  const thinkingLabel = document.getElementById('thinking-label');
   const versionLabel = document.getElementById('version');
 
   if (!form || !input || !sendButton || !stopButton || !newChatButton || !chatMessages || !thinkingIndicator) {
@@ -558,12 +580,8 @@ ${scriptContent}
   }
 
   function scrollToBottom(container, force) {
-    const shouldScroll = force ? true : isNearBottom(container);
-    if (shouldScroll) {
+    if (force || userPinnedToBottom) {
       container.scrollTop = container.scrollHeight;
-      userPinnedToBottom = true;
-    } else {
-      userPinnedToBottom = false;
     }
   }
 
@@ -575,46 +593,101 @@ ${scriptContent}
     }
   }
 
+  function formatTimestamp(value) {
+    if (!value) {
+      return 'unknown';
+    }
+    try {
+      return new Date(value).toLocaleTimeString();
+    } catch (_error) {
+      return 'unknown';
+    }
+  }
+
   function renderContextPreview(preview) {
     if (!contextPreviewContent) return;
 
-    const sections = [];
-
-    if (preview.hasEditor && preview.editorFile) {
-      const fileEscaped = escapeHtml(preview.editorFile);
-      const langEscaped = escapeHtml(preview.editorLanguage || 'unknown');
-      const linesEscaped = escapeHtml(preview.editorLines || '');
-      sections.push({
-        title: '=== EDITOR CONTEXT ===',
-        content: 'File: ' + fileEscaped + '\\nLanguage: ' + langEscaped + '\\n' + linesEscaped + '\\n\\n[Content truncated for preview]'
-      });
-    }
-
-    if (preview.hasWorkspace && preview.workspaceFiles && preview.workspaceFiles.length > 0) {
-      const fileList = preview.workspaceFiles.map(function(f) {
-        return '  • ' + escapeHtml(f);
-      }).join('\\n');
-      sections.push({
-        title: '=== WORKSPACE CONTEXT ===',
-        content: 'Files (' + preview.workspaceFiles.length + '):\\n' + fileList + '\\n\\n[Content excerpts truncated for preview]'
-      });
-    }
-
-    if (preview.finalPrompt) {
-      sections.push({
-        title: '=== FINAL PROMPT SENT TO MODEL ===',
-        content: escapeHtml(preview.finalPrompt)
-      });
-    }
-
-    if (sections.length === 0) {
+    if (!preview) {
       contextPreviewContent.textContent = 'No context available for this message.';
       return;
     }
 
-    contextPreviewContent.innerHTML = sections.map(function(s) {
-      return '<div class="section"><div class="section-title">' + s.title + '</div>' + s.content + '</div>';
-    }).join('\\n');
+    const sections = [];
+    const snapshotLines = [];
+    snapshotLines.push('Captured: ' + formatTimestamp(preview.capturedAt));
+    snapshotLines.push('Truncated: ' + (preview.truncated ? 'yes' : 'no'));
+    sections.push({
+      title: '=== SNAPSHOT ===',
+      content: snapshotLines.join('\n')
+    });
+
+    if (preview.editor && preview.editor.path) {
+      const dirtyLabel = preview.editor.isDirty ? ' (unsaved)' : '';
+      const editorLines = [
+        'File: ' + escapeHtml(preview.editor.path) + dirtyLabel,
+        'Language: ' + escapeHtml(preview.editor.languageId || 'unknown'),
+        escapeHtml(preview.editor.lines || '')
+      ];
+      sections.push({
+        title: '=== ACTIVE EDITOR ===',
+        content: editorLines.join('\n')
+      });
+    }
+
+    if (Array.isArray(preview.includedFiles) && preview.includedFiles.length > 0) {
+      const includedLines = preview.includedFiles.map(function (file) {
+        let label = '  • ' + escapeHtml(file);
+        if (preview.editor && preview.editor.path === file) {
+          label += preview.editor.isDirty ? ' (active · unsaved)' : ' (active)';
+        }
+        return label;
+      });
+      sections.push({
+        title: '=== INCLUDED FILES (' + preview.includedFiles.length + ') ===',
+        content: includedLines.join('\n')
+      });
+    }
+
+    if (Array.isArray(preview.requestedFiles) && preview.requestedFiles.length > 0) {
+      const requestedLines = preview.requestedFiles.map(function (file) {
+        const safe = escapeHtml(file);
+        if (preview.includedFiles && preview.includedFiles.includes(file)) {
+          return '  • ' + safe + ' (included)';
+        }
+        if (preview.ignoredFiles && preview.ignoredFiles.includes(file)) {
+          return '  • ' + safe + ' (ignored)';
+        }
+        return '  • ' + safe + ' (pending)';
+      });
+      sections.push({
+        title: '=== REQUESTED FILES ===',
+        content: requestedLines.join('\n')
+      });
+    }
+
+    if (Array.isArray(preview.ignoredFiles) && preview.ignoredFiles.length > 0) {
+      const ignoredLines = preview.ignoredFiles.map(function (file) {
+        return '  • ' + escapeHtml(file);
+      });
+      sections.push({
+        title: '=== IGNORED PATHS ===',
+        content: ignoredLines.join('\n')
+      });
+    }
+
+    if (typeof preview.finalPrompt === 'string' && preview.finalPrompt.trim().length > 0) {
+      const snippet = preview.finalPrompt.length > 1200 ? preview.finalPrompt.slice(0, 1200) + '\n…' : preview.finalPrompt;
+      sections.push({
+        title: '=== PROMPT PAYLOAD (TRUNCATED) ===',
+        content: escapeHtml(snippet)
+      });
+    }
+
+    contextPreviewContent.innerHTML = sections
+      .map(function (section) {
+        return '<div class="section"><div class="section-title">' + section.title + '</div>' + section.content + '</div>';
+      })
+      .join('\n');
   }
 
   function appendMessage(role, content, options) {
@@ -667,18 +740,25 @@ ${scriptContent}
     input.disabled = state.streaming;
   }
 
-  function setStreaming(streaming) {
+  function setStreaming(streaming, status) {
     state.streaming = streaming;
     document.body.setAttribute('data-state', streaming ? 'busy' : 'idle');
-    if (streaming) {
-      if (showingWorkingIndicator) {
-        thinkingIndicator.textContent = 'TITAN is working…';
-      } else if (!streamHasProducedToken) {
-        thinkingIndicator.textContent = '';
+
+    if (streaming && thinkingLabel) {
+      switch (status) {
+        case 'thinking':
+          thinkingLabel.textContent = 'Titan is thinking...';
+          break;
+        case 'processing':
+          thinkingLabel.textContent = 'Titan is processing...';
+          break;
+        default:
+          thinkingLabel.textContent = 'Titan is working...';
+          break;
       }
-    } else {
-      thinkingIndicator.textContent = '';
-      showingWorkingIndicator = false;
+    } 
+
+    if (!streaming) {
       streamHasProducedToken = false;
     }
     updateControls();
@@ -738,9 +818,11 @@ ${scriptContent}
 
   // Renders current session's messages in the DOM
   function renderActiveSession() {
+    const currentScrollTop = chatMessages.scrollTop;
+    const wasAtBottom = isNearBottom(chatMessages);
+
     chatMessages.innerHTML = '';
     assistantTemp = null;
-    thinkingIndicator.textContent = '';
     const current = getActiveSession();
     if (current && Array.isArray(current.messages)) {
       current.messages.forEach((entry) => {
@@ -749,10 +831,12 @@ ${scriptContent}
       });
     }
     renderSessionSelector();
-    // Auto-scroll to bottom after rendering
-    setTimeout(function() {
-      scrollToBottom(chatMessages);
-    }, 0);
+
+    if (wasAtBottom) {
+      scrollToBottom(chatMessages, true);
+    } else {
+      chatMessages.scrollTop = currentScrollTop;
+    }
   }
 
   // Create a new session (logic only, backend logic is triggered)
@@ -848,6 +932,8 @@ ${scriptContent}
       if (current) {
         current.messages.push({ role: 'user', content: value, timestamp });
         persistWebviewState();
+        // This is handled by the 'sessions' message handler, which calls renderActiveSession
+        // appendMessage('user', value, { messageId }); // To prevent double rendering
         renderActiveSession();
       }
     }
@@ -916,9 +1002,8 @@ ${scriptContent}
         if (contextPreviewPanel && contextPreviewContent) {
           contextPreviewContent.innerHTML = '';
           renderContextPreview(message.preview);
-          if (contextPreviewContent.innerHTML.trim().length > 0) {
-            contextPreviewPanel.style.display = 'block';
-          } else {
+          // Panel is now manually toggled by the user
+          if (contextPreviewContent.innerHTML.trim().length === 0 && contextPreviewPanel.style.display !== 'none') {
             contextPreviewPanel.style.display = 'none';
           }
         }
@@ -1070,9 +1155,8 @@ ${scriptContent}
         autoResize();
         break;
       case 'status':
-        setStreaming(message.state === 'busy');
-        if (message.state !== 'busy') {
-          hideWorkingIndicator();
+        setStreaming(message.status !== 'idle', message.status);
+        if (message.status === 'idle') {
           input.focus();
           autoResize();
         }

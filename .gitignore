@@ -1,6 +1,10 @@
 node_modules/
 dist/
 .vscode/
+.vscode-test/
 .env
 *.log
 tmp/
+Titan_wind/
+*.vsix
+out/

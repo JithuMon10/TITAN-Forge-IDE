@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+package exa.language_server_pb;
+
+// The language server service definition.
+service LanguageServerService {
+  // Gets code completions.
+  rpc GetCompletions(GetCompletionsRequest) returns (GetCompletionsResponse);
+  // Accepts a completion.
+  rpc AcceptCompletion(AcceptCompletionRequest) returns (AcceptCompletionResponse);
+  // Heartbeat to keep the connection alive.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Gets an authentication token.
+  rpc GetAuthToken(GetAuthTokenRequest) returns (GetAuthTokenResponse);
+  // Registers a new user.
+  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+  // Cancels a request.
+  rpc CancelRequest(CancelRequestMessage) returns (CancelResponse);
+}
+
+message Document {
+  string text = 1;
+  int64 cursor_offset = 2;
+  string editor_language = 3;
+  int32 language = 4;
+  string absolute_path_migrate_me_to_uri = 5;
+  string line_ending = 6;
+}
+
+message EditorOptions {
+  int32 tab_size = 1;
+  bool insert_spaces = 2;
+}
+
+message Metadata {
+  string ide_name = 1;
+  string extension_version = 2;
+  string ide_version = 3;
+  int64 request_id = 4;
+  string api_key = 5;
+}
+
+message GetCompletionsRequest {
+  Document document = 1;
+  EditorOptions editor_options = 2;
+  Metadata metadata = 3;
+}
+
+message CompletionPart {
+  string text = 1;
+  string type = 2; // e.g., "COMPLETION_PART_TYPE_INLINE"
+  int64 offset = 3;
+}
+
+message CompletionRange {
+  int64 start_offset = 1;
+  int64 end_offset = 2;
+}
+
+message Completion {
+  string completion_id = 1;
+}
+
+message CompletionItem {
+  Completion completion = 1;
+  CompletionRange range = 2;
+  string source = 3;
+  repeated CompletionPart completion_parts = 4;
+}
+
+message GetCompletionsResponse {
+  repeated CompletionItem completion_items = 1;
+  string state = 2;
+  string request_info = 3;
+}
+
+message AcceptCompletionRequest {
+  Metadata metadata = 1;
+  string completion_id = 2;
+}
+
+message AcceptCompletionResponse {}
+
+message HeartbeatRequest {
+  Metadata metadata = 1;
+}
+
+message HeartbeatResponse {}
+
+message GetAuthTokenRequest {}
+
+message GetAuthTokenResponse {
+  string auth_token = 1;
+}
+
+message RegisterUserRequest {
+  string firebase_id_token = 1;
+}
+
+message RegisterUserResponse {
+  string api_key = 1;
+}
+
+message CancelRequestMessage {
+  Metadata metadata = 1;
+  int64 request_id = 2;
+}
+
+message CancelResponse {}

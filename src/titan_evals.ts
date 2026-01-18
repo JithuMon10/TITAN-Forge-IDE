@@ -111,7 +111,7 @@ function createUri(fsPath: string): any {
 }
 
 class RelativePattern {
-  constructor(public readonly base: any, public readonly pattern: string) {}
+  constructor(public readonly base: any, public readonly pattern: string) { }
 }
 
 class Memento {
@@ -130,7 +130,7 @@ class Memento {
 }
 
 class MockTextDocument {
-  constructor(private readonly value: string, public readonly uri: any) {}
+  constructor(private readonly value: string, public readonly uri: any) { }
 
   getText(): string {
     return this.value;
@@ -317,6 +317,21 @@ const mockContext: any = {
   extensionPath: workspaceRoot
 };
 
+// Mock LiveWorkspace for headless evals
+class MockLiveWorkspace {
+  getDocument(_fsPath: string): undefined {
+    return undefined;
+  }
+  getAllDocuments(): never[] {
+    return [];
+  }
+  dispose(): void {
+    // no-op
+  }
+}
+
+const mockLiveWorkspace = new MockLiveWorkspace();
+
 const dummyOllama = {
   streamCompletion: async () => {
     throw new Error('streamCompletion should not be called in headless evals');
@@ -324,7 +339,7 @@ const dummyOllama = {
 };
 
 function createHeadlessProvider(scriptQueue: ScriptedStream[]) {
-  const provider = new ChatProvider(mockContext, dummyOllama as any, new MockOutputChannel('Titan Eval Harness'), 'test-eval');
+  const provider = new ChatProvider(mockContext, mockLiveWorkspace as any, dummyOllama as any, new MockOutputChannel('Titan Eval Harness'), 'test-eval');
   const sessionId = (provider as any).activeSessionId as string;
   const queue = [...scriptQueue];
 
