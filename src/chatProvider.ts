@@ -633,10 +633,12 @@ export class ChatProvider implements vscode.Disposable {
     }
 
     const conversationHistory = this.formatConversationHistory();
+    const workspaceFilesContext = this.formatWorkspaceFilesContext();
 
     const includePrompt = options?.includePrompt ?? true;
     const sections = [
       `[SYSTEM_INSTRUCTIONS]\n${SYSTEM_PROMPT}\n[/SYSTEM_INSTRUCTIONS]`,
+      workspaceFilesContext,
       baseInfo.contextBlocks.join('\n\n'),
       conversationHistory,
       includePrompt && prompt.trim().length > 0 ? `[USER_PROMPT]\n${prompt}\n[/USER_PROMPT]` : ''
@@ -686,6 +688,60 @@ export class ChatProvider implements vscode.Disposable {
       .map((message) => `${message.role === 'user' ? 'USER' : 'ASSISTANT'}: ${message.content}`)
       .join('\n');
     return `[CONVERSATION_HISTORY]\n${serialized}\n[/CONVERSATION_HISTORY]`;
+  }
+
+  private formatWorkspaceFilesContext(): string {
+    const workspaceFiles = this.liveWorkspace.getWorkspaceFiles();
+    const openDocs = this.liveWorkspace.getAllDocuments();
+
+    if (workspaceFiles.length === 0 && openDocs.length === 0) {
+      return '';
+    }
+
+    const lines: string[] = [];
+    lines.push('[WORKSPACE_FILES]');
+    lines.push(`Total files: ${workspaceFiles.length}`);
+    lines.push('');
+
+    // Group by directory
+    const byDir = new Map<string, string[]>();
+    for (const file of workspaceFiles) {
+      const dir = file.relativePath.includes('/')
+        ? file.relativePath.split('/').slice(0, -1).join('/')
+        : '.';
+      if (!byDir.has(dir)) byDir.set(dir, []);
+      byDir.get(dir)!.push(file.relativePath.split('/').pop()!);
+    }
+
+    // Show directory structure (limit to avoid huge context)
+    let shown = 0;
+    for (const [dir, files] of byDir.entries()) {
+      if (shown > 30) {
+        lines.push(`... and ${workspaceFiles.length - shown} more files`);
+        break;
+      }
+      lines.push(`📁 ${dir}/`);
+      for (const file of files.slice(0, 10)) {
+        lines.push(`   ${file}`);
+        shown++;
+      }
+      if (files.length > 10) {
+        lines.push(`   ... and ${files.length - 10} more`);
+      }
+    }
+
+    // Show currently open files with unsaved indicator
+    if (openDocs.length > 0) {
+      lines.push('');
+      lines.push('OPEN EDITORS (live content available):');
+      for (const doc of openDocs) {
+        const status = doc.isDirty ? ' [UNSAVED]' : '';
+        lines.push(`  • ${doc.relativePath}${status}`);
+      }
+    }
+
+    lines.push('[/WORKSPACE_FILES]');
+    return lines.join('\n');
   }
 
   private postInitialState(): void {
